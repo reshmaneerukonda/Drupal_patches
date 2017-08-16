@@ -1,0 +1,1935 @@
+diff --git a/core/lib/Drupal/Core/Entity/Entity.php b/core/lib/Drupal/Core/Entity/Entity.php
+index f36f74f..c2c404d 100644
+--- a/core/lib/Drupal/Core/Entity/Entity.php
++++ b/core/lib/Drupal/Core/Entity/Entity.php
+@@ -315,6 +315,9 @@ protected function urlRouteParameters($rel) {
+     if ($rel === 'revision' && $this instanceof RevisionableInterface) {
+       $uri_route_parameters[$this->getEntityTypeId() . '_revision'] = $this->getRevisionId();
+     }
++    if ($rel === 'uuid') {
++      $uri_route_parameters[$this->getEntityTypeId()] = $this->uuid();
++    }
+ 
+     return $uri_route_parameters;
+   }
+diff --git a/core/lib/Drupal/Core/Entity/Routing/DefaultHtmlRouteProvider.php b/core/lib/Drupal/Core/Entity/Routing/DefaultHtmlRouteProvider.php
+index fb40fd5..f1f5ddf 100644
+--- a/core/lib/Drupal/Core/Entity/Routing/DefaultHtmlRouteProvider.php
++++ b/core/lib/Drupal/Core/Entity/Routing/DefaultHtmlRouteProvider.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\Core\Entity\Routing;
+ 
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\Config\Entity\ConfigEntityTypeInterface;
+ use Drupal\Core\Entity\Controller\EntityController;
+ use Drupal\Core\Entity\EntityFieldManagerInterface;
+@@ -24,6 +25,7 @@
+  * - edit-form
+  * - delete-form
+  * - collection
++ * - uuid
+  *
+  * @see \Drupal\Core\Entity\Routing\AdminHtmlRouteProvider.
+  */
+@@ -82,6 +84,12 @@ public function getRoutes(EntityTypeInterface $entity_type) {
+       $collection->add("entity.{$entity_type_id}.add_form", $add_form_route);
+     }
+ 
++    // This goes before canonical because the UUID pattern must be tested before
++    // non-integer entity IDs.
++    if ($uuid_route = $this->getUuidRoute($entity_type)) {
++      $collection->add("entity.{$entity_type_id}.uuid", $uuid_route);
++    }
++
+     if ($canonical_route = $this->getCanonicalRoute($entity_type)) {
+       $collection->add("entity.{$entity_type_id}.canonical", $canonical_route);
+     }
+@@ -233,6 +241,34 @@ protected function getCanonicalRoute(EntityTypeInterface $entity_type) {
+   }
+ 
+   /**
++   * Gets the UUID route.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeInterface $entity_type
++   *   The entity type.
++   *
++   * @return \Symfony\Component\Routing\Route|null
++   *   The generated route, if available.
++   */
++  protected function getUuidRoute(EntityTypeInterface $entity_type) {
++    if ($entity_type->getKey('uuid') && $entity_type->hasViewBuilderClass() && $entity_type->hasLinkTemplate('uuid')) {
++      $entity_type_id = $entity_type->id();
++      $route = new Route($entity_type->getLinkTemplate('uuid'));
++      $route
++        ->addDefaults([
++          '_entity_view' => $entity_type_id . '.full',
++          '_title_callback' => '\Drupal\Core\Entity\Controller\EntityController::title',
++        ])
++        ->setRequirement('_entity_access', $entity_type_id . '.view')
++        ->setOption('parameters', [
++          $entity_type_id => ['type' => 'entity:' . $entity_type_id],
++        ])
++        // Set requirement for UUID pattern.
++        ->setRequirement($entity_type_id, '^' . Uuid::VALID_PATTERN . '$');
++      return $route;
++    }
++  }
++
++  /**
+    * Gets the edit-form route.
+    *
+    * @param \Drupal\Core\Entity\EntityTypeInterface $entity_type
+diff --git a/core/lib/Drupal/Core/Menu/DefaultMenuLinkTreeManipulators.php b/core/lib/Drupal/Core/Menu/DefaultMenuLinkTreeManipulators.php
+index 7eefd12..4c156c5 100644
+--- a/core/lib/Drupal/Core/Menu/DefaultMenuLinkTreeManipulators.php
++++ b/core/lib/Drupal/Core/Menu/DefaultMenuLinkTreeManipulators.php
+@@ -133,11 +133,36 @@ public function checkNodeAccess(array $tree) {
+     $node_links = [];
+     $this->collectNodeLinks($tree, $node_links);
+     if ($node_links) {
+-      $nids = array_keys($node_links);
+-
+-      $query = $this->entityTypeManager->getStorage('node')->getQuery();
+-      $query->condition('nid', $nids, 'IN');
++      // These could be serial node IDs or UUIDs.
++      $node_identifiers = array_keys($node_links);
++      $nids = array_filter($node_identifiers, function ($value) {
++        return is_int($value) || ctype_digit((string) $value);
++      });
++      $uuids = array_diff($node_identifiers, $nids);
+ 
++      // Create a query that will retrieve node IDs and UUIDs.
++      $query = $this->queryFactory->getAggregate('node');
++      if (!empty($nids) && !empty($uuids)) {
++        $query
++          ->groupBy('nid')
++          ->groupBy('uuid');
++        $group = $query
++          ->orConditionGroup()
++          ->condition('nid', $nids, 'IN')
++          ->condition('uuid', $uuids, 'IN');
++        $query->condition($group);
++        $result_keys = ['nid', 'uuid'];
++      }
++      elseif (!empty($nids)) {
++        $query->groupBy('nid');
++        $query->condition('nid', $nids, 'IN');
++        $result_keys = ['nid'];
++      }
++      else {
++        $query->groupBy('uuid');
++        $query->condition('uuid', $uuids, 'IN');
++        $result_keys = ['uuid'];
++      }
+       // Allows admins to view all nodes, by both disabling node_access
+       // query rewrite as well as not checking for the node status. The
+       // 'view own unpublished nodes' permission is ignored to not require cache
+@@ -150,15 +175,18 @@ public function checkNodeAccess(array $tree) {
+         $access_result->addCacheContexts(['user.node_grants:view']);
+         $query->condition('status', NodeInterface::PUBLISHED);
+       }
+-
+-      $nids = $query->execute();
+-      foreach ($nids as $nid) {
+-        foreach ($node_links[$nid] as $key => $link) {
+-          $node_links[$nid][$key]->access = $access_result;
++      // Attach the access result to the menu tree for the use nodes the user is
++      // allowed to access.
++      foreach ($query->execute() as $result) {
++        foreach ($result_keys as $key) {
++          if (isset($node_links[$result[$key]])) {
++            foreach ($node_links[$result[$key]] as $node_link_key => $link) {
++              $node_links[$result[$key]][$node_link_key]->access = $access_result;
++            }
++          }
+         }
+       }
+     }
+-
+     return $tree;
+   }
+ 
+@@ -175,7 +203,7 @@ public function checkNodeAccess(array $tree) {
+    */
+   protected function collectNodeLinks(array &$tree, array &$node_links) {
+     foreach ($tree as $key => &$element) {
+-      if ($element->link->getRouteName() == 'entity.node.canonical') {
++      if (in_array($element->link->getRouteName(), ['entity.node.canonical', 'entity.node.uuid'], TRUE)) {
+         $nid = $element->link->getRouteParameters()['node'];
+         $node_links[$nid][$key] = $element;
+         // Deny access by default. checkNodeAccess() will re-add it.
+diff --git a/core/lib/Drupal/Core/ParamConverter/EntityConverter.php b/core/lib/Drupal/Core/ParamConverter/EntityConverter.php
+index 67f6a89..21d2371 100644
+--- a/core/lib/Drupal/Core/ParamConverter/EntityConverter.php
++++ b/core/lib/Drupal/Core/ParamConverter/EntityConverter.php
+@@ -2,13 +2,14 @@
+ 
+ namespace Drupal\Core\ParamConverter;
+ 
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\Entity\EntityInterface;
+ use Drupal\Core\Entity\EntityManagerInterface;
+ use Drupal\Core\TypedData\TranslatableInterface;
+ use Symfony\Component\Routing\Route;
+ 
+ /**
+- * Parameter converter for upcasting entity IDs to full objects.
++ * Parameter converter for upcasting entity IDs or UUIDs to full objects.
+  *
+  * This is useful in cases where the dynamic elements of the path can't be
+  * auto-determined; for example, if your path refers to multiple of the same
+@@ -57,18 +58,28 @@ public function __construct(EntityManagerInterface $entity_manager) {
+ 
+   /**
+    * {@inheritdoc}
++   *
++   *  The value here can be either a serial entity ID, or the entity UUID.
+    */
+   public function convert($value, $definition, $name, array $defaults) {
+     $entity_type_id = $this->getEntityTypeFromDefaults($definition, $name, $defaults);
++    $entity = NULL;
+     if ($storage = $this->entityManager->getStorage($entity_type_id)) {
+-      $entity = $storage->load($value);
++    // Load by UUID or ID depending on $value. Optimise skipping the UUID check and loading by UUID
++      if (!(is_int($value) || ctype_digit((string) $value)) && Uuid::isValid($value)) {
++        $entities = $storage->loadByProperties(['uuid' => $value]);
++        $entity = ($entities) ? reset($entities) : NULL;
++      }
++      if (!$entity) {
++        $entity = $storage->load($value);
++      }
+       // If the entity type is translatable, ensure we return the proper
+       // translation object for the current context.
+       if ($entity instanceof EntityInterface && $entity instanceof TranslatableInterface) {
+         $entity = $this->entityManager->getTranslationFromContext($entity, NULL, ['operation' => 'entity_upcast']);
+       }
+-      return $entity;
+     }
++    return $entity;
+   }
+ 
+   /**
+diff --git a/core/lib/Drupal/Core/Url.php b/core/lib/Drupal/Core/Url.php
+index 76dc46c..96a857e 100644
+--- a/core/lib/Drupal/Core/Url.php
++++ b/core/lib/Drupal/Core/Url.php
+@@ -4,6 +4,7 @@
+ 
+ use Drupal\Component\Utility\NestedArray;
+ use Drupal\Component\Utility\UrlHelper;
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\DependencyInjection\DependencySerializationTrait;
+ use Drupal\Core\Routing\RouteMatchInterface;
+ use Drupal\Core\Routing\UrlGeneratorInterface;
+@@ -229,7 +230,8 @@ public static function fromUserInput($user_input, $options = []) {
+    *   that are known not to be handled by the Drupal routing system (such as
+    *   static files), use base: for the scheme to get a link relative to the
+    *   Drupal base path (like the <base> HTML element). For a link to an entity
+-   *   you may use entity:{entity_type}/{entity_id} URIs. The internal: scheme
++   *   you may use entity:{entity_type}/{entity_id} URIs. Note that {entity_id}
++   *   can be either a UUID or the entity ID. The internal: scheme
+    *   should be avoided except when processing actual user input that may or
+    *   may not correspond to a Drupal route. Normally use Url::fromRoute() for
+    *   code linking to any any Drupal page.
+@@ -341,10 +343,14 @@ public static function fromUri($uri, $options = []) {
+   protected static function fromEntityUri(array $uri_parts, array $options, $uri) {
+     list($entity_type_id, $entity_id) = explode('/', $uri_parts['path'], 2);
+     if ($uri_parts['scheme'] != 'entity' || $entity_id === '') {
+-      throw new \InvalidArgumentException("The entity URI '$uri' is invalid. You must specify the entity id in the URL. e.g., entity:node/1 for loading the canonical path to node entity with id 1.");
++      throw new \InvalidArgumentException("The entity URI '$uri' is invalid. You must specify the entity id in the URL. e.g., entity:node/1 or entity:node/{uuid} for loading the canonical path to node entity with id 1.");
+     }
+-
+-    return new static("entity.$entity_type_id.canonical", [$entity_type_id => $entity_id], $options);
++    $route_name = "entity.$entity_type_id.canonical";
++    if (Uuid::isValid($entity_id)) {
++      // UUID instead of entity ID.
++      $route_name = "entity.$entity_type_id.uuid";
++    }
++    return new static($route_name, [$entity_type_id => $entity_id], $options);
+   }
+ 
+   /**
+diff --git a/core/modules/aggregator/src/Entity/Feed.php b/core/modules/aggregator/src/Entity/Feed.php
+index 3b14e8c..05ee930 100644
+--- a/core/modules/aggregator/src/Entity/Feed.php
++++ b/core/modules/aggregator/src/Entity/Feed.php
+@@ -31,6 +31,7 @@
+  *   },
+  *   links = {
+  *     "canonical" = "/aggregator/sources/{aggregator_feed}",
++ *     "uuid" = "/aggregator/sources/{aggregator_feed}",
+  *     "edit-form" = "/aggregator/sources/{aggregator_feed}/configure",
+  *     "delete-form" = "/aggregator/sources/{aggregator_feed}/delete",
+  *   },
+diff --git a/core/modules/menu_ui/menu_ui.module b/core/modules/menu_ui/menu_ui.module
+index cffccde..3be9c13 100644
+--- a/core/modules/menu_ui/menu_ui.module
++++ b/core/modules/menu_ui/menu_ui.module
+@@ -204,8 +204,13 @@ function menu_ui_get_menu_link_defaults(NodeInterface $node) {
+     // Give priority to the default menu
+     $type_menus = $node_type->getThirdPartySetting('menu_ui', 'available_menus', ['main']);
+     if (in_array($menu_name, $type_menus)) {
+-      $query = \Drupal::entityQuery('menu_link_content')
+-        ->condition('link.uri', 'node/' . $node->id())
++      $query = \Drupal::entityQuery('menu_link_content');
++      $group = $query->orConditionGroup()
++        ->condition('link.uri', 'entity:node/' . $node->id())
++        ->condition('link.uri', 'entity:node/' . $node->uuid())
++        ->condition('link.uri', 'internal:/node/' . $node->id())
++        ->condition('link.uri', 'internal:/node/' . $node->uuid());
++      $query->condition($group)
+         ->condition('menu_name', $menu_name)
+         ->sort('id', 'ASC')
+         ->range(0, 1);
+@@ -215,8 +220,13 @@ function menu_ui_get_menu_link_defaults(NodeInterface $node) {
+     }
+     // Check all allowed menus if a link does not exist in the default menu.
+     if (!$id && !empty($type_menus)) {
+-      $query = \Drupal::entityQuery('menu_link_content')
++      $query = \Drupal::entityQuery('menu_link_content');
++      $group = $query->orConditionGroup()
+         ->condition('link.uri', 'entity:node/' . $node->id())
++        ->condition('link.uri', 'entity:node/' . $node->uuid())
++        ->condition('link.uri', 'internal:/node/' . $node->id())
++        ->condition('link.uri', 'internal:/node/' . $node->uuid());
++      $query->condition($group)
+         ->condition('menu_name', array_values($type_menus), 'IN')
+         ->sort('id', 'ASC')
+         ->range(0, 1);
+diff --git a/core/modules/menu_ui/src/Tests/MenuNodeTest.php b/core/modules/menu_ui/src/Tests/MenuNodeTest.php
+index 3f1bba0..0098806 100644
+--- a/core/modules/menu_ui/src/Tests/MenuNodeTest.php
++++ b/core/modules/menu_ui/src/Tests/MenuNodeTest.php
+@@ -3,6 +3,8 @@
+ namespace Drupal\menu_ui\Tests;
+ 
+ use Drupal\simpletest\WebTestBase;
++use Drupal\Core\Url;
++use Drupal\node\Entity\NodeType;
+ use Drupal\language\Entity\ConfigurableLanguage;
+ use Drupal\menu_link_content\Entity\MenuLinkContent;
+ use Drupal\node\Entity\Node;
+@@ -12,330 +14,370 @@
+  *
+  * @group menu_ui
+  */
+-class MenuNodeTest extends WebTestBase {
+-
+-  /**
+-   * An editor user.
+-   *
+-   * @var \Drupal\user\UserInterface
+-   */
+-  protected $editor;
+-
+-  /**
+-   * Modules to enable.
+-   *
+-   * @var array
+-   */
+-  public static $modules = ['menu_ui', 'test_page_test', 'node', 'block', 'locale', 'language', 'content_translation'];
+-
+-  protected function setUp() {
+-    parent::setUp();
+-
+-    $this->drupalPlaceBlock('system_menu_block:main');
+-    $this->drupalPlaceBlock('page_title_block');
+-
+-    $this->drupalCreateContentType(['type' => 'page', 'name' => 'Basic page']);
+-
+-    $this->editor = $this->drupalCreateUser([
+-      'access administration pages',
+-      'administer content types',
+-      'administer menu',
+-      'create page content',
+-      'edit any page content',
+-      'delete any page content',
+-      'create content translations',
+-      'update content translations',
+-      'delete content translations',
+-      'translate any entity',
+-    ]);
+-    $this->drupalLogin($this->editor);
+-  }
+-
+-  /**
+-   * Test creating, editing, deleting menu links via node form widget.
+-   */
+-  public function testMenuNodeFormWidget() {
+-    // Verify that cacheability metadata is bubbled from the menu link tree
+-    // access checking that is performed when determining the "default parent
+-    // item" options in menu_ui_form_node_type_form_alter(). The "log out" link
+-    // adds the "user.roles:authenticated" cache context.
+-    $this->drupalGet('admin/structure/types/manage/page');
+-    $this->assertCacheContext('user.roles:authenticated');
+-
+-    // Verify that the menu link title has the correct maxlength.
+-    $max_length = \Drupal::entityManager()->getBaseFieldDefinitions('menu_link_content')['title']->getSetting('max_length');
+-    $this->drupalGet('node/add/page');
+-    $this->assertPattern('/<input .* id="edit-menu-title" .* maxlength="' . $max_length . '" .* \/>/', 'Menu link title field has correct maxlength in node add form.');
+-
+-    // Disable the default main menu, so that no menus are enabled.
+-    $edit = [
+-      'menu_options[main]' => FALSE,
+-    ];
+-    $this->drupalPostForm('admin/structure/types/manage/page', $edit, t('Save content type'));
+-
+-    // Verify that no menu settings are displayed and nodes can be created.
+-    $this->drupalGet('node/add/page');
+-    $this->assertText(t('Create Basic page'));
+-    $this->assertNoText(t('Menu settings'));
+-    $node_title = $this->randomMachineName();
+-    $edit = [
+-      'title[0][value]' => $node_title,
+-      'body[0][value]' => $this->randomString(),
+-    ];
+-    $this->drupalPostForm(NULL, $edit, t('Save'));
+-    $node = $this->drupalGetNodeByTitle($node_title);
+-    $this->assertEqual($node->getTitle(), $edit['title[0][value]']);
+-
+-    // Test that we cannot set a menu item from a menu that is not set as
+-    // available.
+-    $edit = [
+-      'menu_options[tools]' => 1,
+-      'menu_parent' => 'main:',
+-    ];
+-    $this->drupalPostForm('admin/structure/types/manage/page', $edit, t('Save content type'));
+-    $this->assertText(t('The selected menu item is not under one of the selected menus.'));
+-    $this->assertNoRaw(t('The content type %name has been updated.', ['%name' => 'Basic page']));
+-
+-    // Enable Tools menu as available menu.
+-    $edit = [
+-      'menu_options[main]' => 1,
+-      'menu_options[tools]' => 1,
+-      'menu_parent' => 'main:',
+-    ];
+-    $this->drupalPostForm('admin/structure/types/manage/page', $edit, t('Save content type'));
+-    $this->assertRaw(t('The content type %name has been updated.', ['%name' => 'Basic page']));
+-
+-    // Test that we can preview a node that will create a menu item.
+-    $edit = [
+-      'title[0][value]' => $node_title,
+-      'menu[enabled]' => 1,
+-      'menu[title]' => 'Test preview',
+-    ];
+-    $this->drupalPostForm('node/add/page', $edit, t('Preview'));
+-
+-    // Create a node.
+-    $node_title = $this->randomMachineName();
+-    $edit = [
+-      'title[0][value]' => $node_title,
+-      'body[0][value]' => $this->randomString(),
+-    ];
+-    $this->drupalPostForm('node/add/page', $edit, t('Save'));
+-    $node = $this->drupalGetNodeByTitle($node_title);
+-    // Assert that there is no link for the node.
+-    $this->drupalGet('test-page');
+-    $this->assertNoLink($node_title);
+-
+-    // Edit the node, enable the menu link setting, but skip the link title.
+-    $edit = [
+-      'menu[enabled]' => 1,
+-    ];
+-    $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
+-    // Assert that there is no link for the node.
+-    $this->drupalGet('test-page');
+-    $this->assertNoLink($node_title);
+-
+-    // Use not only the save button, but also the two special buttons:
+-    // 'Save and publish' as well as 'Save and keep published'.
+-    // These buttons just appear for 'administer nodes' users.
+-    $admin_user = $this->drupalCreateUser([
+-      'access administration pages',
+-      'administer content types',
+-      'administer nodes',
+-      'administer menu',
+-      'create page content',
+-      'edit any page content',
+-    ]);
+-    $this->drupalLogin($admin_user);
+-    foreach (['Save and unpublish' => FALSE, 'Save and keep unpublished' => FALSE, 'Save and publish' => TRUE, 'Save and keep published' => TRUE] as $submit => $visible) {
+-      $edit = [
+-        'menu[enabled]' => 1,
+-        'menu[title]' => $node_title,
+-      ];
+-      $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, $submit);
+-      // Assert that the link exists.
+-      $this->drupalGet('test-page');
+-      if ($visible) {
+-        $this->assertLink($node_title, 0, 'Found a menu link after submitted with ' . $submit);
+-      }
+-      else {
+-        $this->assertNoLink($node_title, 'Found no menu link after submitted with ' . $submit);
+-      }
++class MenuNodeTest extends MenuWebTestBase
++{
++
++    /**
++     * An editor user.
++     *
++     * @var \Drupal\user\UserInterface
++     */
++    protected $editor;
++
++    /**
++     * Modules to enable.
++     *
++     * @var array
++     */
++    public static $modules = ['menu_ui', 'test_page_test', 'node', 'block', 'locale', 'language', 'content_translation'];
++
++    protected function setUp()
++    {
++        parent::setUp();
++
++        $this->drupalPlaceBlock('system_menu_block:main');
++        $this->drupalPlaceBlock('page_title_block');
++
++        $this->drupalCreateContentType(['type' => 'page', 'name' => 'Basic page']);
++
++        $this->editor = $this->drupalCreateUser([
++            'access administration pages',
++            'administer content types',
++            'administer menu',
++            'create page content',
++            'edit any page content',
++            'delete any page content',
++            'create content translations',
++            'update content translations',
++            'delete content translations',
++            'translate any entity',
++        ]);
++        $this->drupalLogin($this->editor);
+     }
+ 
+-    // Log back in as normal user.
+-    $this->drupalLogin($this->editor);
+-    // Edit the node and create a menu link.
+-    $edit = [
+-      'menu[enabled]' => 1,
+-      'menu[title]' => $node_title,
+-      'menu[weight]' => 17,
+-    ];
+-    $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
+-    // Assert that the link exists.
+-    $this->drupalGet('test-page');
+-    $this->assertLink($node_title);
+-
+-    $this->drupalGet('node/' . $node->id() . '/edit');
+-    $this->assertFieldById('edit-menu-weight', 17, 'Menu weight correct in edit form');
+-    $this->assertPattern('/<input .* id="edit-menu-title" .* maxlength="' . $max_length . '" .* \/>/', 'Menu link title field has correct maxlength in node edit form.');
+-
+-    // Disable the menu link, then edit the node--the link should stay disabled.
+-    $link_id = menu_ui_get_menu_link_defaults($node)['entity_id'];
+-    /** @var \Drupal\menu_link_content\Entity\MenuLinkContent $link */
+-    $link = MenuLinkContent::load($link_id);
+-    $link->set('enabled', FALSE);
+-    $link->save();
+-    $this->drupalPostForm($node->urlInfo('edit-form'), $edit, t('Save'));
+-    $link = MenuLinkContent::load($link_id);
+-    $this->assertFalse($link->isEnabled(), 'Saving a node with a disabled menu link keeps the menu link disabled.');
+-
+-    // Edit the node and remove the menu link.
+-    $edit = [
+-      'menu[enabled]' => FALSE,
+-    ];
+-    $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
+-    // Assert that there is no link for the node.
+-    $this->drupalGet('test-page');
+-    $this->assertNoLink($node_title);
+-
+-    // Add a menu link to the Administration menu.
+-    $item = MenuLinkContent::create([
+-      'link' => [['uri' => 'entity:node/' . $node->id()]],
+-      'title' => $this->randomMachineName(16),
+-      'menu_name' => 'admin',
+-    ]);
+-    $item->save();
+-
+-    // Assert that disabled Administration menu is not shown on the
+-    // node/$nid/edit page.
+-    $this->drupalGet('node/' . $node->id() . '/edit');
+-    $this->assertText('Provide a menu link', 'Link in not allowed menu not shown in node edit form');
+-    // Assert that the link is still in the Administration menu after save.
+-    $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
+-    $link = MenuLinkContent::load($item->id());
+-    $this->assertTrue($link, 'Link in not allowed menu still exists after saving node');
+-
+-    // Move the menu link back to the Tools menu.
+-    $item->menu_name->value = 'tools';
+-    $item->save();
+-    // Create a second node.
+-    $child_node = $this->drupalCreateNode(['type' => 'article']);
+-    // Assign a menu link to the second node, being a child of the first one.
+-    $child_item = MenuLinkContent::create([
+-      'link' => [['uri' => 'entity:node/' . $child_node->id()]],
+-      'title' => $this->randomMachineName(16),
+-      'parent' => $item->getPluginId(),
+-      'menu_name' => $item->getMenuName(),
+-    ]);
+-    $child_item->save();
+-    // Edit the first node.
+-    $this->drupalGet('node/' . $node->id() . '/edit');
+-    // Assert that it is not possible to set the parent of the first node to itself or the second node.
+-    $this->assertNoOption('edit-menu-menu-parent', 'tools:' . $item->getPluginId());
+-    $this->assertNoOption('edit-menu-menu-parent', 'tools:' . $child_item->getPluginId());
+-    // Assert that unallowed Administration menu is not available in options.
+-    $this->assertNoOption('edit-menu-menu-parent', 'admin:');
+-  }
+-
+-  /**
+-   * Testing correct loading and saving of menu links via node form widget in a multilingual environment.
+-   */
+-  public function testMultilingualMenuNodeFormWidget() {
+-    // Setup languages.
+-    $langcodes = ['de'];
+-    foreach ($langcodes as $langcode) {
+-      ConfigurableLanguage::createFromLangcode($langcode)->save();
++    /**
++     * Test creating, editing, deleting menu links via node form widget.
++     */
++    public function testMenuNodeFormWidget()
++    {
++        // Verify that cacheability metadata is bubbled from the menu link tree
++        // access checking that is performed when determining the "default parent
++        // item" options in menu_ui_form_node_type_form_alter(). The "log out" link
++        // adds the "user.roles:authenticated" cache context.
++        $this->drupalGet('admin/structure/types/manage/page');
++        $this->assertCacheContext('user.roles:authenticated');
++
++        // Verify that the menu link title has the correct maxlength.
++        $max_length = \Drupal::entityManager()->getBaseFieldDefinitions('menu_link_content')['title']->getSetting('max_length');
++        $this->drupalGet('node/add/page');
++        $this->assertPattern('/<input .* id="edit-menu-title" .* maxlength="' . $max_length . '" .* \/>/', 'Menu link title field has correct maxlength in node add form.');
++
++        // Disable the default main menu, so that no menus are enabled.
++        $edit = [
++            'menu_options[main]' => FALSE,
++        ];
++        $this->drupalPostForm('admin/structure/types/manage/page', $edit, t('Save content type'));
++
++        // Verify that no menu settings are displayed and nodes can be created.
++        $this->drupalGet('node/add/page');
++        $this->assertText(t('Create Basic page'));
++        $this->assertNoText(t('Menu settings'));
++        $node_title = $this->randomMachineName();
++        $edit = [
++            'title[0][value]' => $node_title,
++            'body[0][value]' => $this->randomString(),
++        ];
++        $this->drupalPostForm(NULL, $edit, t('Save'));
++        $node = $this->drupalGetNodeByTitle($node_title);
++        $this->assertEqual($node->getTitle(), $edit['title[0][value]']);
++
++        // Test that we cannot set a menu item from a menu that is not set as
++        // available.
++        $edit = [
++            'menu_options[tools]' => 1,
++            'menu_parent' => 'main:',
++        ];
++        $this->drupalPostForm('admin/structure/types/manage/page', $edit, t('Save content type'));
++        $this->assertText(t('The selected menu item is not under one of the selected menus.'));
++        $this->assertNoRaw(t('The content type %name has been updated.', ['%name' => 'Basic page']));
++
++        // Enable Tools menu as available menu.
++        $edit = [
++            'menu_options[main]' => 1,
++            'menu_options[tools]' => 1,
++            'menu_parent' => 'main:',
++        ];
++        $this->drupalPostForm('admin/structure/types/manage/page', $edit, t('Save content type'));
++        $this->assertRaw(t('The content type %name has been updated.', ['%name' => 'Basic page']));
++
++        // Test that we can preview a node that will create a menu item.
++        $edit = [
++            'title[0][value]' => $node_title,
++            'menu[enabled]' => 1,
++            'menu[title]' => 'Test preview',
++        ];
++        $this->drupalPostForm('node/add/page', $edit, t('Preview'));
++
++        // Create a node.
++        $node_title = $this->randomMachineName();
++        $edit = [
++            'title[0][value]' => $node_title,
++            'body[0][value]' => $this->randomString(),
++        ];
++        $this->drupalPostForm('node/add/page', $edit, t('Save'));
++        $node = $this->drupalGetNodeByTitle($node_title);
++        // Assert that there is no link for the node.
++        $this->drupalGet('test-page');
++        $this->assertNoLink($node_title);
++
++        // Edit the node, enable the menu link setting, but skip the link title.
++        $edit = [
++            'menu[enabled]' => 1,
++        ];
++        $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
++        // Assert that there is no link for the node.
++        $this->drupalGet('test-page');
++        $this->assertNoLink($node_title);
++
++        // Use not only the save button, but also the two special buttons:
++        // 'Save and publish' as well as 'Save and keep published'.
++        // These buttons just appear for 'administer nodes' users.
++        $admin_user = $this->drupalCreateUser([
++            'access administration pages',
++            'administer content types',
++            'administer nodes',
++            'administer menu',
++            'create page content',
++            'edit any page content',
++        ]);
++        $this->drupalLogin($admin_user);
++        foreach (['Save and unpublish' => FALSE, 'Save and keep unpublished' => FALSE, 'Save and publish' => TRUE, 'Save and keep published' => TRUE] as $submit => $visible) {
++            $edit = [
++                'menu[enabled]' => 1,
++                'menu[title]' => $node_title,
++            ];
++            $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, $submit);
++            // Assert that the link exists.
++            $this->drupalGet('test-page');
++            if ($visible) {
++                $this->assertLink($node_title, 0, 'Found a menu link after submitted with ' . $submit);
++            } else {
++                $this->assertNoLink($node_title, 'Found no menu link after submitted with ' . $submit);
++            }
++        }
++
++        // Log back in as normal user.
++        $this->drupalLogin($this->editor);
++        // Edit the node and create a menu link.
++        $edit = [
++            'menu[enabled]' => 1,
++            'menu[title]' => $node_title,
++            'menu[weight]' => 17,
++        ];
++        $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
++        // Assert that the link exists.
++        $this->drupalGet('test-page');
++        $this->assertLink($node_title);
++
++        $this->drupalGet('node/' . $node->id() . '/edit');
++        $this->assertFieldById('edit-menu-weight', 17, 'Menu weight correct in edit form');
++        $this->assertPattern('/<input .* id="edit-menu-title" .* maxlength="' . $max_length . '" .* \/>/', 'Menu link title field has correct maxlength in node edit form.');
++
++        // Disable the menu link, then edit the node--the link should stay disabled.
++        $link_id = menu_ui_get_menu_link_defaults($node)['entity_id'];
++        /** @var \Drupal\menu_link_content\Entity\MenuLinkContent $link */
++        $link = MenuLinkContent::load($link_id);
++        $link->set('enabled', FALSE);
++        $link->save();
++        $this->drupalPostForm($node->urlInfo('edit-form'), $edit, t('Save'));
++        $link = MenuLinkContent::load($link_id);
++        $this->assertFalse($link->isEnabled(), 'Saving a node with a disabled menu link keeps the menu link disabled.');
++
++        // Edit the node and remove the menu link.
++        $edit = [
++            'menu[enabled]' => FALSE,
++        ];
++        $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
++        // Assert that there is no link for the node.
++        $this->drupalGet('test-page');
++        $this->assertNoLink($node_title);
++
++        // Add a menu link to the Administration menu.
++        $item = MenuLinkContent::create([
++            'link' => [['uri' => 'entity:node/' . $node->id()]],
++            'title' => $this->randomMachineName(16),
++            'menu_name' => 'admin',
++        ]);
++        $item->save();
++
++        // Assert that disabled Administration menu is not shown on the
++        // node/$nid/edit page.
++        $this->drupalGet('node/' . $node->id() . '/edit');
++        $this->assertText('Provide a menu link', 'Link in not allowed menu not shown in node edit form');
++        // Assert that the link is still in the Administration menu after save.
++        $this->drupalPostForm('node/' . $node->id() . '/edit', $edit, t('Save'));
++        $link = MenuLinkContent::load($item->id());
++        $this->assertTrue($link, 'Link in not allowed menu still exists after saving node');
++
++        // Move the menu link back to the Tools menu.
++        $item->menu_name->value = 'tools';
++        $item->save();
++        // Create a second node.
++        $child_node = $this->drupalCreateNode(['type' => 'article']);
++        // Assign a menu link to the second node, being a child of the first one.
++        $child_item = MenuLinkContent::create([
++            'link' => [['uri' => 'entity:node/' . $child_node->id()]],
++            'title' => $this->randomMachineName(16),
++            'parent' => $item->getPluginId(),
++            'menu_name' => $item->getMenuName(),
++        ]);
++        $child_item->save();
++        // Edit the first node.
++        $this->drupalGet('node/' . $node->id() . '/edit');
++        // Assert that it is not possible to set the parent of the first node to itself or the second node.
++        $this->assertNoOption('edit-menu-menu-parent', 'tools:' . $item->getPluginId());
++        $this->assertNoOption('edit-menu-menu-parent', 'tools:' . $child_item->getPluginId());
++        // Assert that unallowed Administration menu is not available in options.
++        $this->assertNoOption('edit-menu-menu-parent', 'admin:');
+     }
+-    array_unshift($langcodes, \Drupal::languageManager()->getDefaultLanguage()->getId());
+ 
+-    $config = \Drupal::service('config.factory')->getEditable('language.negotiation');
+-    // Ensure path prefix is used to determine the language.
+-    $config->set('url.source', 'path_prefix');
+-    // Ensure that there's a path prefix set for english as well.
+-    $config->set('url.prefixes.' . $langcodes[0], $langcodes[0]);
+-    $config->save();
+-
+-    $this->rebuildContainer();
+-
+-    $languages = [];
+-    foreach ($langcodes as $langcode) {
+-      $languages[$langcode] = ConfigurableLanguage::load($langcode);
++    /**
++     * Testing correct loading and saving of menu links via node form widget in a multilingual environment.
++     */
++    public function testMultilingualMenuNodeFormWidget()
++    {
++        // Setup languages.
++        $langcodes = ['de'];
++        foreach ($langcodes as $langcode) {
++            ConfigurableLanguage::createFromLangcode($langcode)->save();
++        }
++        array_unshift($langcodes, \Drupal::languageManager()->getDefaultLanguage()->getId());
++
++        $config = \Drupal::service('config.factory')->getEditable('language.negotiation');
++        // Ensure path prefix is used to determine the language.
++        $config->set('url.source', 'path_prefix');
++        // Ensure that there's a path prefix set for english as well.
++        $config->set('url.prefixes.' . $langcodes[0], $langcodes[0]);
++        $config->save();
++
++        $this->rebuildContainer();
++
++        $languages = [];
++        foreach ($langcodes as $langcode) {
++            $languages[$langcode] = ConfigurableLanguage::load($langcode);
++        }
++
++        // Use a UI form submission to make the node type and menu link content entity translatable.
++        $this->drupalLogout();
++        $this->drupalLogin($this->rootUser);
++        $edit = [
++            'entity_types[node]' => TRUE,
++            'entity_types[menu_link_content]' => TRUE,
++            'settings[node][page][settings][language][language_alterable]' => TRUE,
++            'settings[node][page][translatable]' => TRUE,
++            'settings[node][page][fields][title]' => TRUE,
++            'settings[menu_link_content][menu_link_content][translatable]' => TRUE,
++        ];
++        $this->drupalPostForm('admin/config/regional/content-language', $edit, t('Save configuration'));
++
++        // Log out and back in as normal user.
++        $this->drupalLogout();
++        $this->drupalLogin($this->editor);
++
++        // Create a node.
++        $node_title = $this->randomMachineName(8);
++        $node = Node::create([
++            'type' => 'page',
++            'title' => $node_title,
++            'body' => $this->randomMachineName(16),
++            'uid' => $this->editor->id(),
++            'status' => 1,
++            'langcode' => $langcodes[0],
++        ]);
++        $node->save();
++
++        // Create translation.
++        $translated_node_title = $this->randomMachineName(8);
++        $node->addTranslation($langcodes[1], ['title' => $translated_node_title, 'body' => $this->randomMachineName(16), 'status' => 1]);
++        $node->save();
++
++        // Edit the node and create a menu link.
++        $edit = [
++            'menu[enabled]' => 1,
++            'menu[title]' => $node_title,
++            'menu[weight]' => 17,
++        ];
++        $options = ['language' => $languages[$langcodes[0]]];
++        $url = $node->toUrl('edit-form', $options);
++        $this->drupalPostForm($url, $edit, t('Save') . ' ' . t('(this translation)'));
++
++        // Edit the node in a different language and translate the menu link.
++        $edit = [
++            'menu[enabled]' => 1,
++            'menu[title]' => $translated_node_title,
++            'menu[weight]' => 17,
++        ];
++        $options = ['language' => $languages[$langcodes[1]]];
++        $url = $node->toUrl('edit-form', $options);
++        $this->drupalPostForm($url, $edit, t('Save') . ' ' . t('(this translation)'));
++
++        // Assert that the original link exists in the frontend.
++        $this->drupalGet('node/' . $node->id(), ['language' => $languages[$langcodes[0]]]);
++        $this->assertLink($node_title);
++
++        // Assert that the translated link exists in the frontend.
++        $this->drupalGet('node/' . $node->id(), ['language' => $languages[$langcodes[1]]]);
++        $this->assertLink($translated_node_title);
++
++        // Revisit the edit page in original language, check the loaded menu item title and save.
++        $options = ['language' => $languages[$langcodes[0]]];
++        $url = $node->toUrl('edit-form', $options);
++        $this->drupalGet($url);
++        $this->assertFieldById('edit-menu-title', $node_title);
++        $this->drupalPostForm(NULL, [], t('Save') . ' ' . t('(this translation)'));
++
++        // Revisit the edit page of the translation and check the loaded menu item title.
++        $options = ['language' => $languages[$langcodes[1]]];
++        $url = $node->toUrl('edit-form', $options);
++        $this->drupalGet($url);
++        $this->assertFieldById('edit-menu-title', $translated_node_title);
+     }
+ 
+-    // Use a UI form submission to make the node type and menu link content entity translatable.
+-    $this->drupalLogout();
+-    $this->drupalLogin($this->rootUser);
+-    $edit = [
+-      'entity_types[node]' => TRUE,
+-      'entity_types[menu_link_content]' => TRUE,
+-      'settings[node][page][settings][language][language_alterable]' => TRUE,
+-      'settings[node][page][translatable]' => TRUE,
+-      'settings[node][page][fields][title]' => TRUE,
+-      'settings[menu_link_content][menu_link_content][translatable]' => TRUE,
+-    ];
+-    $this->drupalPostForm('admin/config/regional/content-language', $edit, t('Save configuration'));
+-
+-    // Log out and back in as normal user.
+-    $this->drupalLogout();
+-    $this->drupalLogin($this->editor);
+-
+-    // Create a node.
+-    $node_title = $this->randomMachineName(8);
+-    $node = Node::create([
+-      'type' => 'page',
+-      'title' => $node_title,
+-      'body' => $this->randomMachineName(16),
+-      'uid' => $this->editor->id(),
+-      'status' => 1,
+-      'langcode' => $langcodes[0],
+-    ]);
+-    $node->save();
+-
+-    // Create translation.
+-    $translated_node_title = $this->randomMachineName(8);
+-    $node->addTranslation($langcodes[1], ['title' => $translated_node_title, 'body' => $this->randomMachineName(16), 'status' => 1]);
+-    $node->save();
+-
+-    // Edit the node and create a menu link.
+-    $edit = [
+-      'menu[enabled]' => 1,
+-      'menu[title]' => $node_title,
+-      'menu[weight]' => 17,
+-    ];
+-    $options = ['language' => $languages[$langcodes[0]]];
+-    $url = $node->toUrl('edit-form', $options);
+-    $this->drupalPostForm($url, $edit, t('Save') . ' ' . t('(this translation)'));
+-
+-    // Edit the node in a different language and translate the menu link.
+-    $edit = [
+-      'menu[enabled]' => 1,
+-      'menu[title]' => $translated_node_title,
+-      'menu[weight]' => 17,
+-    ];
+-    $options = ['language' => $languages[$langcodes[1]]];
+-    $url = $node->toUrl('edit-form', $options);
+-    $this->drupalPostForm($url, $edit, t('Save') . ' ' . t('(this translation)'));
+-
+-    // Assert that the original link exists in the frontend.
+-    $this->drupalGet('node/' . $node->id(), ['language' => $languages[$langcodes[0]]]);
+-    $this->assertLink($node_title);
+-
+-    // Assert that the translated link exists in the frontend.
+-    $this->drupalGet('node/' . $node->id(), ['language' => $languages[$langcodes[1]]]);
+-    $this->assertLink($translated_node_title);
+-
+-    // Revisit the edit page in original language, check the loaded menu item title and save.
+-    $options = ['language' => $languages[$langcodes[0]]];
+-    $url = $node->toUrl('edit-form', $options);
+-    $this->drupalGet($url);
+-    $this->assertFieldById('edit-menu-title', $node_title);
+-    $this->drupalPostForm(NULL, [], t('Save') . ' ' . t('(this translation)'));
+-
+-    // Revisit the edit page of the translation and check the loaded menu item title.
+-    $options = ['language' => $languages[$langcodes[1]]];
+-    $url = $node->toUrl('edit-form', $options);
+-    $this->drupalGet($url);
+-    $this->assertFieldById('edit-menu-title', $translated_node_title);
+-  }
++    /**
++     * Tests adding links to nodes using the /node/{uuid} format.
++     */
++    public function testNodeUuidLink()
++    {
++        /* @var \Drupal\node\NodeTypeInterface $type */
++        $type = NodeType::load('page');
++        // Enable the main menu for this node type..
++        $menu_name = 'main';
++        $type->setThirdPartySetting('menu_ui', 'available_menus', [$menu_name]);
++        $type->save();
++
++        // Test links using node/{uuid}.
++        $node6 = $this->drupalCreateNode(['type' => 'page']);
++        $uuid_link = $this->addMenuLink('', '/node/' . $node6->uuid(), $menu_name);
++        $this->verifyMenuLink($uuid_link, $node6);
++        $this->drupalGet($node6->url('edit-form'));
++        $this->assertFieldByName('menu[title]', $uuid_link->label());
++        $this->drupalPostForm(NULL, [], t('Save'));
++        \Drupal::entityManager()->getStorage('menu_link_content')->resetCache([$uuid_link->id()]);
++        /** @var \Drupal\menu_link_content\MenuLinkContentInterface $uuid_link */
++        $uuid_link = MenuLinkContent::load($uuid_link->id());
++        $this->assertEqual($uuid_link->getUrlObject(), Url::fromUri('internal:/node/' . $node6->uuid()));
++
++        // Test with entity:node/{uuid}.
++        $node7 = $this->drupalCreateNode(['type' => 'page']);
++        $uuid_link = $this->addMenuLink('', 'entity:node/' . $node7->uuid(), $menu_name);
++        $this->verifyMenuLink($uuid_link, $node7);
++        $this->drupalGet($node7->url('edit-form'));
++        $this->assertFieldByName('menu[title]', $uuid_link->label());
++        $this->drupalPostForm(NULL, [], t('Save'));
++        \Drupal::entityManager()->getStorage('menu_link_content')->resetCache([$uuid_link->id()]);
++        /** @var \Drupal\menu_link_content\MenuLinkContentInterface $uuid_link */
++        $uuid_link = MenuLinkContent::load($uuid_link->id());
++        $this->assertEqual($uuid_link->getUrlObject(), Url::fromUri('entity:node/' . $node7->uuid()));
++    }
+ 
+ }
+diff --git a/core/modules/menu_ui/src/Tests/MenuTest.php b/core/modules/menu_ui/src/Tests/MenuTest.php
+index dde9502..c6beb0c 100644
+--- a/core/modules/menu_ui/src/Tests/MenuTest.php
++++ b/core/modules/menu_ui/src/Tests/MenuTest.php
+@@ -70,7 +70,7 @@ protected function setUp() {
+     $this->drupalCreateContentType(['type' => 'article', 'name' => 'Article']);
+ 
+     // Create users.
+-    $this->adminUser = $this->drupalCreateUser(['access administration pages', 'administer blocks', 'administer menu', 'create article content']);
++    $this->adminUser = $this->drupalCreateUser(['access administration pages', 'administer blocks', 'administer menu', 'create article content', 'edit any article content']);
+     $this->authenticatedUser = $this->drupalCreateUser([]);
+   }
+ 
+@@ -584,55 +584,6 @@ public function testBlockContextualLinks() {
+   }
+ 
+   /**
+-   * Adds a menu link using the UI.
+-   *
+-   * @param string $parent
+-   *   Optional parent menu link id.
+-   * @param string $path
+-   *   The path to enter on the form. Defaults to the front page.
+-   * @param string $menu_name
+-   *   Menu name. Defaults to 'tools'.
+-   * @param bool $expanded
+-   *   Whether or not this menu link is expanded. Setting this to TRUE should
+-   *   test whether it works when we do the authenticatedUser tests. Defaults
+-   *   to FALSE.
+-   * @param string $weight
+-   *   Menu weight. Defaults to 0.
+-   *
+-   * @return \Drupal\menu_link_content\Entity\MenuLinkContent
+-   *   A menu link entity.
+-   */
+-  public function addMenuLink($parent = '', $path = '/', $menu_name = 'tools', $expanded = FALSE, $weight = '0') {
+-    // View add menu link page.
+-    $this->drupalGet("admin/structure/menu/manage/$menu_name/add");
+-    $this->assertResponse(200);
+-
+-    $title = '!link_' . $this->randomMachineName(16);
+-    $edit = [
+-      'link[0][uri]' => $path,
+-      'title[0][value]' => $title,
+-      'description[0][value]' => '',
+-      'enabled[value]' => 1,
+-      'expanded[value]' => $expanded,
+-      'menu_parent' => $menu_name . ':' . $parent,
+-      'weight[0][value]' => $weight,
+-    ];
+-
+-    // Add menu link.
+-    $this->drupalPostForm(NULL, $edit, t('Save'));
+-    $this->assertResponse(200);
+-    $this->assertText('The menu link has been saved.');
+-
+-    $menu_links = entity_load_multiple_by_properties('menu_link_content', ['title' => $title]);
+-
+-    $menu_link = reset($menu_links);
+-    $this->assertTrue($menu_link, 'Menu link was found in database.');
+-    $this->assertMenuLink($menu_link->getPluginId(), ['menu_name' => $menu_name, 'children' => [], 'parent' => $parent]);
+-
+-    return $menu_link;
+-  }
+-
+-  /**
+    * Attempts to add menu link with invalid path or no access permission.
+    */
+   public function addInvalidMenuLink() {
+@@ -689,45 +640,6 @@ public function checkInvalidParentMenuLinks() {
+   }
+ 
+   /**
+-   * Verifies a menu link using the UI.
+-   *
+-   * @param \Drupal\menu_link_content\Entity\MenuLinkContent $item
+-   *   Menu link.
+-   * @param object $item_node
+-   *   Menu link content node.
+-   * @param \Drupal\menu_link_content\Entity\MenuLinkContent $parent
+-   *   Parent menu link.
+-   * @param object $parent_node
+-   *   Parent menu link content node.
+-   */
+-  public function verifyMenuLink(MenuLinkContent $item, $item_node, MenuLinkContent $parent = NULL, $parent_node = NULL) {
+-    // View home page.
+-    $this->drupalGet('');
+-    $this->assertResponse(200);
+-
+-    // Verify parent menu link.
+-    if (isset($parent)) {
+-      // Verify menu link.
+-      $title = $parent->getTitle();
+-      $this->assertLink($title, 0, 'Parent menu link was displayed');
+-
+-      // Verify menu link link.
+-      $this->clickLink($title);
+-      $title = $parent_node->label();
+-      $this->assertTitle(t("@title | Drupal", ['@title' => $title]), 'Parent menu link link target was correct');
+-    }
+-
+-    // Verify menu link.
+-    $title = $item->getTitle();
+-    $this->assertLink($title, 0, 'Menu link was displayed');
+-
+-    // Verify menu link link.
+-    $this->clickLink($title);
+-    $title = $item_node->label();
+-    $this->assertTitle(t("@title | Drupal", ['@title' => $title]), 'Menu link link target was correct');
+-  }
+-
+-  /**
+    * Changes the parent of a menu link using the UI.
+    *
+    * @param \Drupal\menu_link_content\MenuLinkContentInterface $item
+diff --git a/core/modules/menu_ui/src/Tests/MenuWebTestBase.php b/core/modules/menu_ui/src/Tests/MenuWebTestBase.php
+index e0ee98f..d3badf7 100644
+--- a/core/modules/menu_ui/src/Tests/MenuWebTestBase.php
++++ b/core/modules/menu_ui/src/Tests/MenuWebTestBase.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\menu_ui\Tests;
+ 
++use Drupal\menu_link_content\Entity\MenuLinkContent;
+ use Drupal\simpletest\WebTestBase;
+ 
+ /**
+@@ -74,4 +75,94 @@ public function assertMenuLink($menu_plugin_id, array $expected_item) {
+     }
+   }
+ 
++  /**
++   * Adds a menu link using the UI.
++   *
++   * @param string $parent
++   *   Optional parent menu link id.
++   * @param string $path
++   *   The path to enter on the form. Defaults to the front page.
++   * @param string $menu_name
++   *   Menu name. Defaults to 'tools'.
++   * @param bool $expanded
++   *   Whether or not this menu link is expanded. Setting this to TRUE should
++   *   test whether it works when we do the authenticatedUser tests. Defaults
++   *   to FALSE.
++   * @param string $weight
++   *   Menu weight. Defaults to 0.
++   *
++   * @return \Drupal\menu_link_content\Entity\MenuLinkContent
++   *   A menu link entity.
++   */
++  public function addMenuLink($parent = '', $path = '/', $menu_name = 'tools', $expanded = FALSE, $weight = '0') {
++    // View add menu link page.
++    $this->drupalGet("admin/structure/menu/manage/$menu_name/add");
++    $this->assertResponse(200);
++
++    $title = '!link_' . $this->randomMachineName(16);
++    $edit = [
++      'link[0][uri]' => $path,
++      'title[0][value]' => $title,
++      'description[0][value]' => '',
++      'enabled[value]' => 1,
++      'expanded[value]' => $expanded,
++      'menu_parent' => $menu_name . ':' . $parent,
++      'weight[0][value]' => $weight,
++    ];
++
++    // Add menu link.
++    $this->drupalPostForm(NULL, $edit, t('Save'));
++    $this->assertResponse(200);
++    $this->assertText('The menu link has been saved.');
++
++    $menu_links = entity_load_multiple_by_properties('menu_link_content', ['title' => $title]);
++
++    $menu_link = reset($menu_links);
++    $this->assertTrue($menu_link, 'Menu link was found in database.');
++    $this->assertMenuLink($menu_link->getPluginId(), [
++      'menu_name' => $menu_name,
++      'children' => [],
++      'parent' => $parent,
++    ]);
++    return $menu_link;
++  }
++
++  /**
++   * Verifies a menu link using the UI.
++   *
++   * @param \Drupal\menu_link_content\Entity\MenuLinkContent $item
++   *   Menu link.
++   * @param object $item_node
++   *   Menu link content node.
++   * @param \Drupal\menu_link_content\Entity\MenuLinkContent $parent
++   *   Parent menu link.
++   * @param object $parent_node
++   *   Parent menu link content node.
++   */
++  public function verifyMenuLink(MenuLinkContent $item, $item_node, MenuLinkContent $parent = NULL, $parent_node = NULL) {
++    // View home page.
++    $this->drupalGet('');
++    $this->assertResponse(200);
++
++    // Verify parent menu link.
++    if (isset($parent)) {
++      // Verify menu link.
++      $title = $parent->getTitle();
++      $this->assertLink($title, 0, 'Parent menu link was displayed');
++      // Verify menu link link.
++      $this->clickLink($title);
++      $title = $parent_node->label();
++      $this->assertTitle(t("@title | Drupal", ['@title' => $title]), 'Parent menu link link target was correct');
++    }
++
++    // Verify menu link.
++    $title = $item->getTitle();
++    $this->assertLink($title, 0, 'Menu link was displayed');
++
++    // Verify menu link link.
++    $this->clickLink($title);
++    $title = $item_node->label();
++    $this->assertTitle(t("@title | Drupal", ['@title' => $title]), 'Menu link link target was correct');
++  }
++
+ }
+diff --git a/core/modules/node/src/Entity/Node.php b/core/modules/node/src/Entity/Node.php
+index 4f8efe3..f018c5c 100644
+--- a/core/modules/node/src/Entity/Node.php
++++ b/core/modules/node/src/Entity/Node.php
+@@ -67,6 +67,7 @@
+  *   permission_granularity = "bundle",
+  *   links = {
+  *     "canonical" = "/node/{node}",
++ *     "uuid" = "/node/{node}",
+  *     "delete-form" = "/node/{node}/delete",
+  *     "edit-form" = "/node/{node}/edit",
+  *     "version-history" = "/node/{node}/revisions",
+diff --git a/core/modules/node/src/Entity/NodeRouteProvider.php b/core/modules/node/src/Entity/NodeRouteProvider.php
+index 0803f1e..cb806e8 100644
+--- a/core/modules/node/src/Entity/NodeRouteProvider.php
++++ b/core/modules/node/src/Entity/NodeRouteProvider.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\node\Entity;
+ 
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\Entity\EntityTypeInterface;
+ use Drupal\Core\Entity\Routing\EntityRouteProviderInterface;
+ use Symfony\Component\Routing\Route;
+@@ -15,8 +16,19 @@ class NodeRouteProvider implements EntityRouteProviderInterface {
+   /**
+    * {@inheritdoc}
+    */
+-  public function getRoutes( EntityTypeInterface $entity_type) {
++  public function getRoutes(EntityTypeInterface $entity_type) {
+     $route_collection = new RouteCollection();
++
++    $route = (new Route("/node/{node}"))
++      ->addDefaults([
++        '_controller' => '\Drupal\node\Controller\NodeViewController::view',
++        '_title_callback' => '\Drupal\node\Controller\NodeViewController::title',
++      ])
++      // Set requirement for UUID pattern.
++      ->setRequirement('node', '^' . Uuid::VALID_PATTERN . '$')
++      ->setRequirement('_entity_access', 'node.view');
++    $route_collection->add('entity.node.uuid', $route);
++
+     $route = (new Route('/node/{node}'))
+       ->addDefaults([
+         '_controller' => '\Drupal\node\Controller\NodeViewController::view',
+diff --git a/core/modules/node/tests/src/Functional/NodeAccessMenuLinkTest.php b/core/modules/node/tests/src/Functional/NodeAccessMenuLinkTest.php
+index 6c5bcd4..bbd3fbf 100644
+--- a/core/modules/node/tests/src/Functional/NodeAccessMenuLinkTest.php
++++ b/core/modules/node/tests/src/Functional/NodeAccessMenuLinkTest.php
+@@ -44,29 +44,56 @@ protected function setUp() {
+    */
+   public function testNodeAccessMenuLink() {
+ 
+-    $menu_link_title = $this->randomString();
++    $nid_menu_link_title = $this->randomString();
+ 
+     $this->drupalLogin($this->contentAdminUser);
++    $node_title = $this->randomString();
+     $edit = [
+-      'title[0][value]' => $this->randomString(),
++      'title[0][value]' => $node_title,
+       'body[0][value]' => $this->randomString(),
+       'menu[enabled]' => 1,
+-      'menu[title]' => $menu_link_title,
++      'menu[title]' => $nid_menu_link_title,
+     ];
+     $this->drupalPostForm('node/add/page', $edit, t('Save'));
+-    $this->assertLink($menu_link_title);
++
++    // Create another node to link by UUID.
++    $node = $this->createNode();
++    $uuid_menu_link_title = '!link_' . $this->randomMachineName(16);
++    $edit = [
++      'link[0][uri]' => 'entity:node/' . $node->uuid(),
++      'title[0][value]' => $uuid_menu_link_title,
++      'description[0][value]' => '',
++      'enabled[value]' => 1,
++      'menu_parent' => 'main:',
++    ];
++    // Add menu link.
++    $this->drupalPostForm('admin/structure/menu/manage/main/add', $edit, t('Save'));
++
++    // Ensure you can add a child link to both node menu links.
++    // @see \Drupal\Core\Menu\DefaultMenuLinkTreeManipulators::checkNodeAccess()
++    $this->drupalGet('admin/structure/menu/manage/main/add');
++    $elements = $this->xpath('//select["edit-menu-parent"]//option[contains(text(), :title)]', [':title' => $uuid_menu_link_title]);
++    $this->assertTrue(is_array($elements) && isset($elements[0]), 'Node menu item using UUID can be a parent');
++    $elements = $this->xpath('//select["edit-menu-parent"]//option[contains(text(), :title)]', [':title' => $nid_menu_link_title]);
++    $this->assertTrue(is_array($elements) && isset($elements[0]), 'Node menu item using node ID can be a parent');
++    // Ensure the menu links appear for a user with the correct permissions.
++    $this->drupalGet('');
++    $this->assertLink($nid_menu_link_title);
++    $this->assertLink($uuid_menu_link_title);
+ 
+     // Ensure anonymous users without "access content" permission do not see
+     // this menu link.
+     $this->drupalLogout();
+     $this->drupalGet('');
+-    $this->assertNoLink($menu_link_title);
++    $this->assertNoLink($nid_menu_link_title);
++    $this->assertNoLink($uuid_menu_link_title);
+ 
+     // Ensure anonymous users with "access content" permission see this menu
+     // link.
+     $this->config('user.role.' . RoleInterface::ANONYMOUS_ID)->set('permissions', ['access content'])->save();
+     $this->drupalGet('');
+-    $this->assertLink($menu_link_title);
++    $this->assertLink($nid_menu_link_title);
++    $this->assertLink($uuid_menu_link_title);
+   }
+ 
+ }
+diff --git a/core/modules/system/system.install b/core/modules/system/system.install
+index a93459d..b05cef4 100644
+--- a/core/modules/system/system.install
++++ b/core/modules/system/system.install
+@@ -1789,3 +1789,10 @@ function system_update_8301() {
+     ->set('profile', \Drupal::installProfile())
+     ->save();
+ }
++
++/**
++ * The simple presence of this update function clears cached entity definitions.
++ */
++function system_update_8302() {
++ // Many core entity-types now have a UUID link template and route.
++}
+\ No newline at end of file
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTest.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTest.php
+index f3ada1f..6e6ce8c 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTest.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTest.php
+@@ -42,6 +42,7 @@
+  *   },
+  *   links = {
+  *     "canonical" = "/entity_test/{entity_test}",
++ *     "uuid" = "/entity_test/{entity_test}",
+  *     "add-form" = "/entity_test/add",
+  *     "edit-form" = "/entity_test/manage/{entity_test}/edit",
+  *     "delete-form" = "/entity_test/delete/entity_test/{entity_test}",
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestBaseFieldDisplay.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestBaseFieldDisplay.php
+index 7fe9ce2..a7ed5f2 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestBaseFieldDisplay.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestBaseFieldDisplay.php
+@@ -33,6 +33,7 @@
+  *   },
+  *   links = {
+  *     "canonical" = "/entity_test_base_field_display/{entity_test_base_field_display}/edit",
++ *     "uuid" = "/entity_test_base_field_display/{entity_test_base_field_display}/edit",
+  *     "add-form" = "/entity_test_base_field_display/add",
+  *     "edit-form" = "/entity_test_base_field_display/manage/{entity_test_base_field_display}",
+  *     "delete-form" = "/entity_test/delete/entity_test_base_field_display/{entity_test_base_field_display}/edit",
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMul.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMul.php
+index cbe7ba4..3a11384 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMul.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMul.php
+@@ -36,6 +36,7 @@
+  *     "add-page" = "/entity_test_mul/add",
+  *     "add-form" = "/entity_test_mul/add/{type}",
+  *     "canonical" = "/entity_test_mul/manage/{entity_test_mul}",
++ *     "uuid" = "/entity_test_mul/manage/{entity_test_mul}",
+  *     "edit-form" = "/entity_test_mul/manage/{entity_test_mul}/edit",
+  *     "delete-form" = "/entity_test/delete/entity_test_mul/{entity_test_mul}",
+  *   },
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulChanged.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulChanged.php
+index dd3da09..bfd5ee4 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulChanged.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulChanged.php
+@@ -39,6 +39,7 @@
+  *   links = {
+  *     "add-form" = "/entity_test_mul_changed/add",
+  *     "canonical" = "/entity_test_mul_changed/manage/{entity_test_mul_changed}",
++ *     "uuid" = "/entity_test_mul_changed/manage/{entity_test_mul_changed}",
+  *     "edit-form" = "/entity_test_mul_changed/manage/{entity_test_mul_changed}/edit",
+  *     "delete-form" = "/entity_test/delete/entity_test_mul_changed/{entity_test_mul_changed}",
+  *   },
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulLangcodeKey.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulLangcodeKey.php
+index 94948a3..adc4357 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulLangcodeKey.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulLangcodeKey.php
+@@ -36,6 +36,7 @@
+  *   links = {
+  *     "add-form" = "/entity_test_mul_langcode_key/add",
+  *     "canonical" = "/entity_test_mul_langcode_key/manage/{entity_test_mul_langcode_key}",
++ *     "uuid" = "/entity_test_mul_langcode_key/manage/{entity_test_mul_langcode_key}",
+  *     "edit-form" = "/entity_test_mul_langcode_key/manage/{entity_test_mul_langcode_key}/edit",
+  *     "delete-form" = "/entity_test/delete/entity_test_mul_langcode_key/{entity_test_mul_langcode_key}",
+  *   },
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRev.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRev.php
+index f01675f..e059cfa 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRev.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRev.php
+@@ -39,6 +39,7 @@
+  *   links = {
+  *     "add-form" = "/entity_test_mulrev/add",
+  *     "canonical" = "/entity_test_mulrev/manage/{entity_test_mulrev}",
++ *     "uuid" = "/entity_test_mulrev/manage/{entity_test_mulrev}",
+  *     "delete-form" = "/entity_test/delete/entity_test_mulrev/{entity_test_mulrev}",
+  *     "edit-form" = "/entity_test_mulrev/manage/{entity_test_mulrev}/edit",
+  *     "revision" = "/entity_test_mulrev/{entity_test_mulrev}/revision/{entity_test_mulrev_revision}/view",
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRevChanged.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRevChanged.php
+index 3913075..500b1e3 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRevChanged.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestMulRevChanged.php
+@@ -40,6 +40,7 @@
+  *   links = {
+  *     "add-form" = "/entity_test_mulrev_changed/add",
+  *     "canonical" = "/entity_test_mulrev_changed/manage/{entity_test_mulrev_changed}",
++ *     "uuid" = "/entity_test_mulrev_changed/manage/{entity_test_mulrev_changed}",
+  *     "delete-form" = "/entity_test/delete/entity_test_mulrev_changed/{entity_test_mulrev_changed}",
+  *     "edit-form" = "/entity_test_mulrev_changed/manage/{entity_test_mulrev_changed}/edit",
+  *     "revision" = "/entity_test_mulrev_changed/{entity_test_mulrev_changed}/revision/{entity_test_mulrev_changed_revision}/view",
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestRev.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestRev.php
+index bcbb17b..6bd9abb 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestRev.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestRev.php
+@@ -40,6 +40,7 @@
+  *   links = {
+  *     "add-form" = "/entity_test_rev/add",
+  *     "canonical" = "/entity_test_rev/manage/{entity_test_rev}",
++ *     "uuid" = "/entity_test_rev/manage/{entity_test_rev}",
+  *     "delete-form" = "/entity_test/delete/entity_test_rev/{entity_test_rev}",
+  *     "edit-form" = "/entity_test_rev/manage/{entity_test_rev}/edit",
+  *     "revision" = "/entity_test_rev/{entity_test_rev}/revision/{entity_test_rev_revision}/view",
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestStringId.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestStringId.php
+index 342cbb9..723aa55 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestStringId.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestStringId.php
+@@ -30,6 +30,7 @@
+  *   },
+  *   links = {
+  *     "canonical" = "/entity_test_string_id/manage/{entity_test_string_id}",
++ *     "uuid" = "/entity_test_string_id/manage/{entity_test_string_id}",
+  *     "add-form" = "/entity_test_string_id/add",
+  *     "edit-form" = "/entity_test_string_id/manage/{entity_test_string_id}",
+  *   },
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithBundle.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithBundle.php
+index c668bd3..7ef8e3a 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithBundle.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithBundle.php
+@@ -37,6 +37,7 @@
+  *   bundle_entity_type = "entity_test_bundle",
+  *   links = {
+  *     "canonical" = "/entity_test_with_bundle/{entity_test_with_bundle}",
++ *     "uuid" = "/entity_test_with_bundle/{entity_test_with_bundle}",
+  *     "add-page" = "/entity_test_with_bundle/add",
+  *     "add-form" = "/entity_test_with_bundle/add/{entity_test_bundle}",
+  *     "edit-form" = "/entity_test_with_bundle/{entity_test_with_bundle}/edit",
+diff --git a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithRevisionLog.php b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithRevisionLog.php
+index 4f4f4f1..465e663 100644
+--- a/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithRevisionLog.php
++++ b/core/modules/system/tests/modules/entity_test/src/Entity/EntityTestWithRevisionLog.php
+@@ -37,6 +37,7 @@
+  *   },
+  *   links = {
+  *     "canonical" = "/entity_test_revlog/manage/{entity_test_revlog}",
++ *     "uuid" = "/entity_test_revlog/manage/{entity_test_revlog}",
+  *     "delete-form" = "/entity_test/delete/entity_test_revlog/{entity_test_revlog}",
+  *     "edit-form" = "/entity_test_revlog/manage/{entity_test_revlog}/edit",
+  *     "revision" = "/entity_test_revlog/{entity_test_revlog}/revision/{entity_test_revlog_revision}/view",
+diff --git a/core/modules/taxonomy/src/Entity/Term.php b/core/modules/taxonomy/src/Entity/Term.php
+index 43e62c6..2eb247c 100644
+--- a/core/modules/taxonomy/src/Entity/Term.php
++++ b/core/modules/taxonomy/src/Entity/Term.php
+@@ -44,6 +44,7 @@
+  *   common_reference_target = TRUE,
+  *   links = {
+  *     "canonical" = "/taxonomy/term/{taxonomy_term}",
++ *     "uuid" = "/taxonomy/term/{taxonomy_term}",
+  *     "delete-form" = "/taxonomy/term/{taxonomy_term}/delete",
+  *     "edit-form" = "/taxonomy/term/{taxonomy_term}/edit",
+  *   },
+diff --git a/core/modules/taxonomy/taxonomy.routing.yml b/core/modules/taxonomy/taxonomy.routing.yml
+index 8a3bd1a..4957fa9 100644
+--- a/core/modules/taxonomy/taxonomy.routing.yml
++++ b/core/modules/taxonomy/taxonomy.routing.yml
+@@ -76,6 +76,16 @@ entity.taxonomy_vocabulary.overview_form:
+   requirements:
+     _entity_access: 'taxonomy_vocabulary.view'
+ 
++entity.taxonomy_term.uuid:
++  path: '/taxonomy/term/{taxonomy_term}'
++  defaults:
++    _entity_view: 'taxonomy_term.full'
++    _title: 'Taxonomy term'
++    _title_callback: '\Drupal\taxonomy\Controller\TaxonomyController::termTitle'
++  requirements:
++    _entity_access: 'taxonomy_term.view'
++    taxonomy_term: '[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}'
++
+ entity.taxonomy_term.canonical:
+   path: '/taxonomy/term/{taxonomy_term}'
+   defaults:
+diff --git a/core/modules/user/src/Entity/User.php b/core/modules/user/src/Entity/User.php
+index 7529532..0d37573 100644
+--- a/core/modules/user/src/Entity/User.php
++++ b/core/modules/user/src/Entity/User.php
+@@ -48,6 +48,7 @@
+  *   },
+  *   links = {
+  *     "canonical" = "/user/{user}",
++ *     "uuid" = "/user/{user}",
+  *     "edit-form" = "/user/{user}/edit",
+  *     "cancel-form" = "/user/{user}/cancel",
+  *     "collection" = "/admin/people",
+diff --git a/core/modules/user/src/Entity/UserRouteProvider.php b/core/modules/user/src/Entity/UserRouteProvider.php
+index d1e9671..14543bb 100644
+--- a/core/modules/user/src/Entity/UserRouteProvider.php
++++ b/core/modules/user/src/Entity/UserRouteProvider.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\user\Entity;
+ 
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\Entity\EntityTypeInterface;
+ use Drupal\Core\Entity\Routing\EntityRouteProviderInterface;
+ use Symfony\Component\Routing\Route;
+@@ -17,6 +18,17 @@ class UserRouteProvider implements EntityRouteProviderInterface {
+    */
+   public function getRoutes(EntityTypeInterface $entity_type) {
+     $route_collection = new RouteCollection();
++
++    $route = (new Route("/user/{user}"))
++      ->addDefaults([
++        '_entity_view' => 'user.full',
++        '_title_callback' => 'Drupal\user\Controller\UserController::userTitle',
++      ])
++      // Set requirement for UUID pattern.
++      ->setRequirement('user', '^' . Uuid::VALID_PATTERN . '$')
++      ->setRequirement('_entity_access', 'user.view');
++    $route_collection->add('entity.user.uuid', $route);
++
+     $route = (new Route('/user/{user}'))
+       ->setDefaults([
+         '_entity_view' => 'user.full',
+diff --git a/core/modules/views/src/Plugin/views/argument_validator/Entity.php b/core/modules/views/src/Plugin/views/argument_validator/Entity.php
+index 896d24b..917d3e9 100644
+--- a/core/modules/views/src/Plugin/views/argument_validator/Entity.php
++++ b/core/modules/views/src/Plugin/views/argument_validator/Entity.php
+@@ -2,6 +2,7 @@
+ 
+ namespace Drupal\views\Plugin\views\argument_validator;
+ 
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\Entity\EntityInterface;
+ use Drupal\Core\Entity\EntityManagerInterface;
+ use Drupal\Core\Form\FormStateInterface;
+@@ -170,7 +171,26 @@ public function validateArgument($argument) {
+       return FALSE;
+     }
+ 
+-    $entities = $this->entityManager->getStorage($entity_type)->loadMultiple($ids);
++    $uuids = array_filter($ids, function ($value) {
++      return Uuid::isValid($value);
++    });
++    $ids = array_diff($ids, $uuids);
++
++    $storage = $this->entityManager->getStorage($entity_type);
++    if ($uuids) {
++      $entities = $storage->loadByProperties(['uuid' => $uuids]);
++      if (count($entities) !== count($uuids)) {
++        // Missing one or more UUIDs, break and return false.
++        return FALSE;
++      }
++
++      foreach ($entities as $entity) {
++        if (!$this->validateEntity($entity)) {
++          return FALSE;
++        }
++      }
++    }
++    $entities = $storage->loadMultiple($ids);
+     // Validate each id => entity. If any fails break out and return false.
+     foreach ($ids as $id) {
+       // There is no entity for this ID.
+diff --git a/core/modules/views/tests/src/Unit/Plugin/argument_validator/EntityTest.php b/core/modules/views/tests/src/Unit/Plugin/argument_validator/EntityTest.php
+index 13a7bc9..e65b9ab 100644
+--- a/core/modules/views/tests/src/Unit/Plugin/argument_validator/EntityTest.php
++++ b/core/modules/views/tests/src/Unit/Plugin/argument_validator/EntityTest.php
+@@ -88,6 +88,13 @@ protected function setUp() {
+       ->method('loadMultiple')
+       ->will($this->returnValueMap($value_map));
+ 
++    $uuid_value_map = [
++      [['uuid' => ['fb0920d9-7a0d-42c5-8d11-b31d9ebfae6b']], [1 => $mock_entity]],
++    ];
++    $storage->expects($this->any())
++      ->method('loadByProperties')
++      ->will($this->returnValueMap($uuid_value_map));
++
+     $this->entityManager->expects($this->any())
+       ->method('getStorage')
+       ->with('entity_test')
+@@ -122,7 +129,8 @@ public function testValidateArgumentNoAccess() {
+     $this->assertFalse($this->argumentValidator->validateArgument(''));
+ 
+     $this->assertTrue($this->argumentValidator->validateArgument(1));
+-    $this->assertTrue($this->argumentValidator->validateArgument(2));
++    $this->assertTrue($this->argumentValidator->validateArgument('fb0920d9-7a0d-42c5-8d11-b31d9ebfae6b'));
++    $this->assertFalse($this->argumentValidator->validateArgument('298109c5-c931-4367-af2b-356008905ed1'));
+     $this->assertFalse($this->argumentValidator->validateArgument('1,2'));
+   }
+ 
+diff --git a/core/tests/Drupal/Tests/Core/Entity/Routing/DefaultHtmlRouteProviderTest.php b/core/tests/Drupal/Tests/Core/Entity/Routing/DefaultHtmlRouteProviderTest.php
+index 7e853bc..a6f7ea0 100644
+--- a/core/tests/Drupal/Tests/Core/Entity/Routing/DefaultHtmlRouteProviderTest.php
++++ b/core/tests/Drupal/Tests/Core/Entity/Routing/DefaultHtmlRouteProviderTest.php
+@@ -7,6 +7,7 @@
+ 
+ namespace Drupal\Tests\Core\Entity\Routing;
+ 
++use Drupal\Component\Uuid\Uuid;
+ use Drupal\Core\Config\Entity\ConfigEntityTypeInterface;
+ use Drupal\Core\Entity\EntityFieldManagerInterface;
+ use Drupal\Core\Entity\EntityTypeInterface;
+@@ -302,6 +303,59 @@ public function providerTestGetCollectionRoute() {
+   }
+ 
+   /**
++   * @covers ::getUuidRoute
++   * @dataProvider providerTestGetUuidRoute
++   */
++  public function testGetUuidRoute(EntityTypeInterface $entity_type, Route $expected = NULL) {
++    $route = $this->routeProvider->getUuidRoute($entity_type);
++    $this->assertEquals($expected, $route);
++  }
++
++  public function providerTestGetUuidRoute() {
++    $data = [];
++
++    $entity_type1 = $this->getEntityType();
++    $entity_type1->getKey('uuid')->willReturn(FALSE);
++    $data['no_canonical_link_template'] = [$entity_type1->reveal()];
++
++    $entity_type2 = $this->getEntityType();;
++    $entity_type2->getKey('uuid')->willReturn(TRUE);
++    $entity_type2->hasViewBuilderClass()->willReturn(FALSE);
++    $data['no_view_builder'] = [$entity_type2->reveal()];
++
++    $entity_type3 = $this->getEntityType($entity_type2);;
++    $entity_type3->hasViewBuilderClass()->willReturn(TRUE);
++    $entity_type3->hasLinkTemplate('uuid')->willReturn(FALSE);
++    $data['no_uuid_link_template'] = [$entity_type2->reveal()];
++
++    $entity_type4 = $this->getEntityType($entity_type2);
++    $entity_type4->hasViewBuilderClass()->willReturn(TRUE);
++    $entity_type4->id()->willReturn('the_entity_type_id');
++    $entity_type4->getKey('uuid')->willReturn(TRUE);
++    $entity_type4->hasLinkTemplate('uuid')->willReturn(TRUE);
++    $entity_type4->getLinkTemplate('uuid')->willReturn('/the_entity_type_id/{the_entity_type_id}');
++    $entity_type4->isSubclassOf(FieldableEntityInterface::class)->willReturn(FALSE);
++    $route = (new Route('/the_entity_type_id/{the_entity_type_id}'))
++      ->setDefaults([
++        '_entity_view' => 'the_entity_type_id.full',
++        '_title_callback' => '\Drupal\Core\Entity\Controller\EntityController::title',
++      ])
++      ->setRequirements([
++        '_entity_access' => 'the_entity_type_id.view',
++        'the_entity_type_id' => '^' . Uuid::VALID_PATTERN . '$',
++      ])
++      ->setOptions([
++        'parameters' => [
++          'the_entity_type_id' => [
++            'type' => 'entity:the_entity_type_id',
++          ],
++        ],
++      ]);
++    $data['has_uuid_route'] = [$entity_type4->reveal(), $route];
++    return $data;
++  }
++
++  /**
+    * @covers ::getEntityTypeIdKeyType
+    */
+   public function testGetEntityTypeIdKeyType() {
+@@ -365,5 +419,8 @@ public function getCanonicalRoute(EntityTypeInterface $entity_type) {
+   public function getCollectionRoute(EntityTypeInterface $entity_type) {
+     return parent::getCollectionRoute($entity_type);
+   }
++  public function getUuidRoute(EntityTypeInterface $entity_type) {
++    return parent::getUuidRoute($entity_type);
++  }
+ 
+ }
+diff --git a/core/tests/Drupal/Tests/Core/Menu/DefaultMenuLinkTreeManipulatorsTest.php b/core/tests/Drupal/Tests/Core/Menu/DefaultMenuLinkTreeManipulatorsTest.php
+index beb7828..fe0dea1 100644
+--- a/core/tests/Drupal/Tests/Core/Menu/DefaultMenuLinkTreeManipulatorsTest.php
++++ b/core/tests/Drupal/Tests/Core/Menu/DefaultMenuLinkTreeManipulatorsTest.php
+@@ -5,8 +5,10 @@
+ use Drupal\Core\Access\AccessResult;
+ use Drupal\Core\Cache\Context\CacheContextsManager;
+ use Drupal\Core\DependencyInjection\Container;
++use Drupal\Core\Entity\Query\ConditionInterface;
+ use Drupal\Core\Entity\EntityStorageInterface;
+ use Drupal\Core\Entity\EntityTypeManagerInterface;
++use Drupal\Core\Entity\Query\QueryAggregateInterface;
+ use Drupal\Core\Menu\DefaultMenuLinkTreeManipulators;
+ use Drupal\Core\Menu\MenuLinkTreeElement;
+ use Drupal\Tests\UnitTestCase;
+@@ -264,45 +266,72 @@ public function testFlatten() {
+   }
+ 
+   /**
+-   * Tests the optimized node access checking.
++   * Tests the optimized node access checking with both node IDs or UUIDs.
+    *
+    * @covers ::checkNodeAccess
+    * @covers ::collectNodeLinks
+    * @covers ::checkAccess
+    */
+-  public function testCheckNodeAccess() {
++  public function testCheckNodeAccessUuidAndNid() {
+     $links = [
+       1 => MenuLinkMock::create(['id' => 'node.1', 'route_name' => 'entity.node.canonical', 'title' => 'foo', 'parent' => '', 'route_parameters' => ['node' => 1]]),
+       2 => MenuLinkMock::create(['id' => 'node.2', 'route_name' => 'entity.node.canonical', 'title' => 'bar', 'parent' => '', 'route_parameters' => ['node' => 2]]),
+       3 => MenuLinkMock::create(['id' => 'node.3', 'route_name' => 'entity.node.canonical', 'title' => 'baz', 'parent' => 'node.2', 'route_parameters' => ['node' => 3]]),
+-      4 => MenuLinkMock::create(['id' => 'node.4', 'route_name' => 'entity.node.canonical', 'title' => 'qux', 'parent' => 'node.3', 'route_parameters' => ['node' => 4]]),
+-      5 => MenuLinkMock::create(['id' => 'test.1', 'route_name' => 'test_route', 'title' => 'qux', 'parent' => '']),
+-      6 => MenuLinkMock::create(['id' => 'test.2', 'route_name' => 'test_route', 'title' => 'qux', 'parent' => 'test.1']),
++      4 => MenuLinkMock::create(array('id' => 'node.4', 'route_name' => 'entity.node.uuid', 'title' => 'qux', 'parent' => 'node.3', 'route_parameters' => array('node' => 4))),
++      5 => MenuLinkMock::create(array('id' => 'node.5', 'route_name' => 'entity.node.uuid', 'title' => 'qux', 'parent' => 'node.3', 'route_parameters' => array('node' => '7910d537-04be-450a-8200-b53f49ea6b30'))),
++      6 => MenuLinkMock::create(['id' => 'test.1', 'route_name' => 'test_route', 'title' => 'qux', 'parent' => '']),
++      7 => MenuLinkMock::create(['id' => 'test.2', 'route_name' => 'test_route', 'title' => 'qux', 'parent' => 'test.1']),
+     ];
+     $tree = [];
+     $tree[1] = new MenuLinkTreeElement($links[1], FALSE, 1, FALSE, []);
+     $tree[2] = new MenuLinkTreeElement($links[2], TRUE, 1, FALSE, [
+       3 => new MenuLinkTreeElement($links[3], TRUE, 2, FALSE, [
+         4 => new MenuLinkTreeElement($links[4], FALSE, 3, FALSE, []),
++        5 => new MenuLinkTreeElement($links[5], FALSE, 3, FALSE, []),
+       ]),
+     ]);
+-    $tree[5] = new MenuLinkTreeElement($links[5], TRUE, 1, FALSE, [
+-      6 => new MenuLinkTreeElement($links[6], FALSE, 2, FALSE, []),
++    $tree[6] = new MenuLinkTreeElement($links[6], TRUE, 1, FALSE, [
++      7 => new MenuLinkTreeElement($links[7], FALSE, 2, FALSE, []),
+     ]);
+ 
+     $query = $this->getMock('Drupal\Core\Entity\Query\QueryInterface');
++    $query = $this->getMock(QueryAggregateInterface::class);
++    $condition = $this->getMock(ConditionInterface::class);
+     $query->expects($this->at(0))
+-      ->method('condition')
+-      ->with('nid', [1, 2, 3, 4]);
++      ->method('groupBy')
++      ->with('nid')
++      ->willReturn($query);
+     $query->expects($this->at(1))
++      ->method('groupBy')
++      ->with('uuid')
++      ->willReturn($query);
++    $query->expects($this->once())
++      ->method('orConditionGroup')
++      ->willReturn($condition);
++    $condition->expects($this->at(0))
++      ->method('condition')
++      ->with('nid', [1, 2, 3, 4])
++      ->willReturn($condition);
++    $condition->expects($this->at(1))
++      ->method('condition')
++      ->with('uuid', [4 => '7910d537-04be-450a-8200-b53f49ea6b30'])
++      ->willReturn($condition);
++    $query->expects($this->at(3))
++      ->method('condition')
++      ->with($condition);
++    $query->expects($this->at(4))
+       ->method('condition')
+       ->with('status', NodeInterface::PUBLISHED);
+     $query->expects($this->once())
+       ->method('execute')
+-      ->willReturn([1, 2, 4]);
++      ->willReturn([
++        ['nid' => 1, 'uuid' => '9d7316d5-2614-4679-bc00-ec677f248e4e'],
++        ['nid' => 2, 'uuid' => '2f347698-e682-442b-9d00-f756bf6bec6d'],
++        ['nid' => 4, 'uuid' => '7910d537-04be-450a-8200-b53f49ea6b30'],
++      ]);
+     $storage = $this->getMock(EntityStorageInterface::class);
+     $storage->expects($this->once())
+-      ->method('getQuery')
++      ->method('getAggregate')
+       ->willReturn($query);
+     $this->entityTypeManager->expects($this->once())
+       ->method('getStorage')
+@@ -318,8 +347,8 @@ public function testCheckNodeAccess() {
+     $this->assertEquals(AccessResult::neutral(), $tree[2]->subtree[3]->access);
+     $this->assertEquals($node_access_result, $tree[2]->subtree[3]->subtree[4]->access);
+     // Ensure that other routes than entity.node.canonical are set as well.
+-    $this->assertNull($tree[5]->access);
+-    $this->assertNull($tree[5]->subtree[6]->access);
++    $this->assertNull($tree[6]->access);
++    $this->assertNull($tree[6]->subtree[7]->access);
+ 
+     // On top of the node access checking now run the ordinary route based
+     // access checkers.
+@@ -338,8 +367,69 @@ public function testCheckNodeAccess() {
+     $this->assertEquals($node_access_result, $tree[1]->access);
+     $this->assertEquals($node_access_result, $tree[2]->access);
+     $this->assertEquals(AccessResult::neutral(), $tree[2]->subtree[3]->access);
+-    $this->assertEquals(AccessResult::allowed()->cachePerPermissions(), $tree[5]->access);
+-    $this->assertEquals(AccessResult::neutral()->cachePerPermissions(), $tree[5]->subtree[6]->access);
++    $this->assertEquals(AccessResult::allowed()->cachePerPermissions(), $tree[6]->access);
++    $this->assertEquals(AccessResult::neutral()->cachePerPermissions(), $tree[6]->subtree[7]->access);
++  }
++
++  /**
++   * Tests the optimized node access checking with only node IDs or UUIDs.
++   *
++   * @covers ::checkNodeAccess
++   * @covers ::collectNodeLinks
++   * @covers ::checkAccess
++   *
++   * @dataProvider providerCheckNodeAccessNidOrUuidOnly
++   */
++  public function testCheckNodeAccessNidOrUuidOnly($key, array $values) {
++    $links = [
++      1 => MenuLinkMock::create(['id' => 'node.1', 'route_name' => 'entity.node.canonical', 'title' => 'foo', 'parent' => '', 'route_parameters' => ['node' => $values[0]]]),
++      2 => MenuLinkMock::create(['id' => 'node.2', 'route_name' => 'entity.node.canonical', 'title' => 'bar', 'parent' => '', 'route_parameters' => ['node' => $values[1]]]),
++      3 => MenuLinkMock::create(['id' => 'node.3', 'route_name' => 'entity.node.canonical', 'title' => 'bar', 'parent' => '', 'route_parameters' => ['node' => $values[2]]]),
++    ];
++    $tree = [];
++    $tree[1] = new MenuLinkTreeElement($links[1], FALSE, 1, FALSE, []);
++    $tree[2] = new MenuLinkTreeElement($links[2], TRUE, 1, FALSE, []);
++    $tree[3] = new MenuLinkTreeElement($links[3], TRUE, 1, FALSE, []);
++
++    $query = $this->getMock(QueryAggregateInterface::class);
++    $query->expects($this->at(0))
++      ->method('groupBy')
++      ->with($key)
++      ->willReturn($query);
++    $query->expects($this->at(1))
++      ->method('condition')
++      ->with($key, $values, 'IN');
++    $query->expects($this->at(2))
++      ->method('condition')
++      ->with('status', NODE_PUBLISHED);
++    $query->expects($this->once())
++      ->method('execute')
++      ->willReturn([
++        [$key => $values[0]],
++        [$key => $values[1]],
++      ]);
++    $this->queryFactory->expects($this->once())
++      ->method('getAggregate')
++      ->with('node')
++      ->willReturn($query);
++
++    $node_access_result = AccessResult::allowed()->cachePerPermissions()->addCacheContexts(['user.node_grants:view']);
++
++    $tree = $this->defaultMenuTreeManipulators->checkNodeAccess($tree);
++    $this->assertEquals($node_access_result, $tree[1]->access);
++    $this->assertEquals($node_access_result, $tree[2]->access);
++    // Ensure that access denied is set.
++    $this->assertEquals(AccessResult::neutral(), $tree[3]->access);
++}
++
++  /**
++   * Data provider for self::testCheckNodeAccessNidOrUuidOnly().
++   */
++  public function providerCheckNodeAccessNidOrUuidOnly() {
++    return [
++      ['nid', [1, 2, 3]],
++      ['uuid', ['9d7316d5-2614-4679-bc00-ec677f248e4e', '2f347698-e682-442b-9d00-f756bf6bec6d', '7910d537-04be-450a-8200-b53f49ea6b30']],
++    ];
+   }
+ 
+ }
+diff --git a/core/tests/Drupal/Tests/Core/ParamConverter/EntityConverterTest.php b/core/tests/Drupal/Tests/Core/ParamConverter/EntityConverterTest.php
+index 67decbe..26700f4 100644
+--- a/core/tests/Drupal/Tests/Core/ParamConverter/EntityConverterTest.php
++++ b/core/tests/Drupal/Tests/Core/ParamConverter/EntityConverterTest.php
+@@ -90,6 +90,12 @@ public function testConvert($value, array $definition, array $defaults, $expecte
+         ['valid_id', (object) ['id' => 'valid_id']],
+         ['invalid_id', NULL],
+       ]);
++    $entity_storage->expects($this->any())
++      ->method('loadByProperties')
++      ->willReturnMap([
++        [['uuid' => 'invalid_id'], NULL],
++        [['uuid' => $value], [(object) ['uuid' => $value, 'id' => 'valid_id']]],
++      ]);
+ 
+     $this->assertEquals($expected_result, $this->entityConverter->convert($value, $definition, 'foo', $defaults));
+   }
+@@ -105,6 +111,8 @@ public function providerTestConvert() {
+     $data[] = ['invalid_id', ['type' => 'entity:entity_test'], ['foo' => 'invalid_id'], NULL];
+     // Entity type placeholder.
+     $data[] = ['valid_id', ['type' => 'entity:{entity_type}'], ['foo' => 'valid_id', 'entity_type' => 'entity_test'], (object) ['id' => 'valid_id']];
++    // UUID.
++    $data[] = ['1c5217f4-553c-40d8-8389-a3cc3529d79c', ['type' => 'entity:entity_test'], ['foo' => '1c5217f4-553c-40d8-8389-a3cc3529d79c'], (object) ['uuid' => '1c5217f4-553c-40d8-8389-a3cc3529d79c', 'id' => 'valid_id']];
+ 
+     return $data;
+   }
+diff --git a/core/tests/Drupal/Tests/Core/UrlTest.php b/core/tests/Drupal/Tests/Core/UrlTest.php
+index ff4cb01..5e5f578 100644
+--- a/core/tests/Drupal/Tests/Core/UrlTest.php
++++ b/core/tests/Drupal/Tests/Core/UrlTest.php
+@@ -605,6 +605,14 @@ public function providerTestEntityUris() {
+         ['page' => '1', 'foo' => 'yes', 'focus' => 'no'],
+         'top',
+       ],
++      [
++        'entity:test_entity/d44a0040-2844-4cca-b0b5-20c6c96c4d8c',
++        ['fragment' => ''],
++        'entity.test_entity.uuid',
++        ['test_entity' => 'd44a0040-2844-4cca-b0b5-20c6c96c4d8c'],
++        NULL,
++        NULL,
++      ],
+ 
+     ];
+   }
