@@ -100,7 +100,7 @@ index 7eefd12..4c156c5 100644
 +      $uuids = array_diff($node_identifiers, $nids);
  
 +      // Create a query that will retrieve node IDs and UUIDs.
-+      $query = $this->queryFactory->getAggregate('node');
++      $query = $this->entityTypeManager->getStorage('node')->getAggregateQuery('OR');
 +      if (!empty($nids) && !empty($uuids)) {
 +        $query
 +          ->groupBy('nid')
